@@ -1,0 +1,391 @@
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index d986df2..183c75d 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -196,6 +196,7 @@ actor_rollout_ref:
+     disable_log_stats: true
+     do_sample: true
+     'n': 1
++    seed: 0
+     over_sample_rate: 0
+     multi_stage_wake_up: false
+     engine_kwargs:
+@@ -492,6 +493,11 @@ algorithm:
+   pf_ppo:
+     reweight_method: pow
+     weight_pow: 2.0
++  prompt_sampling:
++    _target_: verl.trainer.config.PromptSamplingConfig
++    enabled: false
++    strict_target_preservation: true
++    apply_importance_correction: true
+ custom_reward_function:
+   path: null
+   name: compute_score
+diff --git a/verl/trainer/config/algorithm.py b/verl/trainer/config/algorithm.py
+index 37cc50c..b588813 100644
+--- a/verl/trainer/config/algorithm.py
++++ b/verl/trainer/config/algorithm.py
+@@ -17,7 +17,22 @@ from typing import Any, Optional
+ 
+ from verl.base_config import BaseConfig
+ 
+-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
++__all__ = [
++    "AlgoConfig",
++    "FilterGroupsConfig",
++    "KLControlConfig",
++    "PromptSamplingConfig",
++    "RolloutCorrectionConfig",
++]
++
++
++@dataclass
++class PromptSamplingConfig(BaseConfig):
++    """Prompt-level target/proposal correction configuration."""
++
++    enabled: bool = False
++    strict_target_preservation: bool = True
++    apply_importance_correction: bool = True
+ 
+ 
+ @dataclass
+@@ -347,6 +362,7 @@ class AlgoConfig(BaseConfig):
+         use_pf_ppo (bool): Whether to enable preference feedback PPO.
+         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
+         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
++        prompt_sampling (PromptSamplingConfig): Prompt target/proposal correction configuration.
+         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
+             Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
+ 
+@@ -373,6 +389,7 @@ class AlgoConfig(BaseConfig):
+     use_pf_ppo: bool = False
+     pf_ppo: dict[str, Any] = field(default_factory=dict)
+     filter_groups: Optional[FilterGroupsConfig] = None
++    prompt_sampling: PromptSamplingConfig = field(default_factory=PromptSamplingConfig)
+     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
+     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
+     rollout_correction: Optional[RolloutCorrectionConfig] = None
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index 39a338e..9b2da55 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -116,6 +116,21 @@ algorithm:
+     # Power used for weight scaling in "pow" method
+     weight_pow: 2.0
+ 
++  # Target-preserving adaptive prompt sampling settings
++  prompt_sampling:
++
++    # Required when converting the algorithm configuration to a dataclass
++    _target_: verl.trainer.config.PromptSamplingConfig
++
++    # Whether to apply prompt-level target/proposal importance correction
++    enabled: False
++
++    # Whether to reject settings outside the strict scientific interpretation
++    strict_target_preservation: True
++
++    # Whether to multiply the prompt contribution by the exact target/proposal ratio
++    apply_importance_correction: True
++
+ # config for the trainer
+ trainer:
+ 
+diff --git a/verl/trainer/config/rollout/rollout.yaml b/verl/trainer/config/rollout/rollout.yaml
+index b57687a..d798c12 100644
+--- a/verl/trainer/config/rollout/rollout.yaml
++++ b/verl/trainer/config/rollout/rollout.yaml
+@@ -101,6 +101,9 @@ do_sample: True
+ # number of responses (i.e. num sample times). > 1 for grpo
+ n: 1
+ 
++# Random seed for rollout generation engines
++seed: 0
++
+ # The over_sample_rate parameter controls the early termination threshold for training rollouts,
+ # where the system will abort remaining requests when (1 - over_sample_rate) * total_requests completions are reached.
+ over_sample_rate: 0
+diff --git a/verl/trainer/ppo/prompt_sampling.py b/verl/trainer/ppo/prompt_sampling.py
+new file mode 100644
+index 0000000..23da2ae
+--- /dev/null
++++ b/verl/trainer/ppo/prompt_sampling.py
+@@ -0,0 +1,206 @@
++# Copyright 2025 Individual Contributor: Anonymous Authors
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Strict prompt-level importance correction for target-preserving RLVR."""
++
++from __future__ import annotations
++
++from typing import Any
++
++import torch
++from omegaconf import OmegaConf
++
++from verl import DataProto
++
++
++def _prompt_sampling_config(config) -> Any:
++    return OmegaConf.select(config, "algorithm.prompt_sampling", default=None)
++
++
++def _enum_value(value) -> str:
++    return str(getattr(value, "value", value)).lower()
++
++
++def validate_prompt_sampling_config(config) -> None:
++    """Reject settings outside the strict target-preservation interpretation."""
++
++    sampling_config = _prompt_sampling_config(config)
++    if sampling_config is None or not bool(sampling_config.get("enabled", False)):
++        return
++    if not bool(sampling_config.get("strict_target_preservation", True)):
++        return
++    if not bool(sampling_config.get("apply_importance_correction", True)):
++        raise ValueError("strict target preservation requires prompt importance correction")
++
++    adv_estimator = OmegaConf.select(config, "algorithm.adv_estimator")
++    if _enum_value(adv_estimator) != "grpo":
++        raise ValueError("strict prompt sampling currently requires GRPO")
++
++    actor = OmegaConf.select(config, "actor_rollout_ref.actor")
++    if actor is None:
++        raise ValueError("strict prompt sampling requires actor configuration")
++    if float(actor.get("entropy_coeff", 0.0)) != 0.0:
++        raise ValueError("strict prompt sampling requires zero actor entropy coefficient")
++    if bool(actor.get("use_kl_loss", False)):
++        raise ValueError("strict prompt sampling does not support an auxiliary actor KL loss")
++    if int(actor.get("ppo_epochs", 1)) != 1:
++        raise ValueError("strict prompt sampling requires exactly one PPO epoch")
++    train_batch_size = OmegaConf.select(config, "data.train_batch_size")
++    ppo_mini_batch_size = actor.get("ppo_mini_batch_size")
++    if train_batch_size is None or ppo_mini_batch_size is None:
++        raise ValueError("strict prompt sampling requires explicit data.train_batch_size and actor.ppo_mini_batch_size")
++    if int(ppo_mini_batch_size) != int(train_batch_size):
++        raise ValueError(
++            "strict prompt sampling requires one actor optimizer step per rollout batch: "
++            "actor.ppo_mini_batch_size must equal data.train_batch_size"
++        )
++    if actor.get("loss_agg_mode") != "seq-mean-token-mean":
++        raise ValueError("strict prompt sampling requires loss_agg_mode=seq-mean-token-mean")
++    loss_mode = actor.get("policy_loss", {}).get("loss_mode", "vanilla")
++    if loss_mode != "vanilla":
++        raise ValueError("strict prompt sampling currently requires the vanilla policy loss")
++
++
++def _require_vector(batch: DataProto, key: str, batch_size: int) -> torch.Tensor:
++    if key not in batch.batch:
++        raise KeyError(f"batch is missing required prompt-sampling tensor {key!r}")
++    value = batch.batch[key]
++    if value.ndim != 1 or value.shape[0] != batch_size:
++        raise ValueError(f"{key} must be a vector with one value per generated response")
++    return value
++
++
++def _validate_positive_finite(value: torch.Tensor, key: str) -> None:
++    if not torch.isfinite(value).all():
++        raise ValueError(f"{key} must be finite")
++    if not torch.all(value > 0):
++        raise ValueError(f"{key} must be positive")
++
++
++def _draw_representatives(
++    draw_number: torch.Tensor,
++    sampling_index: torch.Tensor,
++    sampling_stratum: torch.Tensor,
++    target: torch.Tensor,
++    proposal: torch.Tensor,
++    weight: torch.Tensor,
++) -> torch.Tensor:
++    if draw_number.dtype == torch.bool or draw_number.is_floating_point():
++        raise ValueError("sampling_draw_number must be integer encoded")
++    if sampling_index.dtype == torch.bool or sampling_index.is_floating_point():
++        raise ValueError("sampling_index must be integer encoded")
++    if sampling_stratum.dtype == torch.bool or sampling_stratum.is_floating_point():
++        raise ValueError("sampling_stratum must be integer encoded")
++    if torch.any(draw_number < 0):
++        raise ValueError("sampling_draw_number must be non-negative when prompt sampling is enabled")
++
++    representatives = []
++    for draw in torch.unique(draw_number, sorted=True):
++        positions = torch.nonzero(draw_number == draw, as_tuple=False).flatten()
++        representatives.append(positions[0])
++        for metadata, name in (
++            (sampling_index, "sampling_index"),
++            (sampling_stratum, "sampling_stratum"),
++        ):
++            if not torch.equal(metadata[positions], metadata[positions[0]].expand_as(metadata[positions])):
++                raise ValueError(f"{name} is inconsistent within a repeated prompt draw")
++        for metadata, name in (
++            (target, "sampling_target_probability"),
++            (proposal, "sampling_proposal_probability"),
++            (weight, "sampling_importance_weight"),
++        ):
++            repeated = metadata[positions]
++            if not torch.allclose(repeated, repeated[0].expand_as(repeated), rtol=1e-12, atol=0.0):
++                raise ValueError(f"{name} is inconsistent within a repeated prompt draw")
++    return torch.stack(representatives)
++
++
++def apply_prompt_sampling_correction(batch: DataProto, config) -> dict[str, float]:
++    """Apply exact ``rho/q`` weights to the GRPO policy-gradient advantages.
++
++    This preserves the conditional mean of the sampled GRPO surrogate-gradient
++    contribution under the fixed target distribution.  It does not make Adam
++    parameters or final returns unbiased.
++    """
++
++    sampling_config = _prompt_sampling_config(config)
++    if sampling_config is None or not bool(sampling_config.get("enabled", False)):
++        return {}
++    validate_prompt_sampling_config(config)
++
++    if "sampling_second_moment_proxy" in batch.batch:
++        raise ValueError("prompt sampling correction has already been applied to this batch")
++    if "advantages" not in batch.batch or "response_mask" not in batch.batch:
++        raise KeyError("batch must contain advantages and response_mask before prompt correction")
++    advantages = batch.batch["advantages"]
++    response_mask = batch.batch["response_mask"]
++    if advantages.ndim != 2 or response_mask.shape != advantages.shape:
++        raise ValueError("advantages and response_mask must have matching [batch, response] shapes")
++    batch_size = advantages.shape[0]
++
++    sampling_index = _require_vector(batch, "sampling_index", batch_size)
++    sampling_stratum = _require_vector(batch, "sampling_stratum", batch_size)
++    draw_number = _require_vector(batch, "sampling_draw_number", batch_size)
++    target = _require_vector(batch, "sampling_target_probability", batch_size).to(torch.float64)
++    proposal = _require_vector(batch, "sampling_proposal_probability", batch_size).to(torch.float64)
++    weight = _require_vector(batch, "sampling_importance_weight", batch_size).to(torch.float64)
++    _validate_positive_finite(target, "sampling_target_probability")
++    _validate_positive_finite(proposal, "sampling_proposal_probability")
++    _validate_positive_finite(weight, "sampling_importance_weight")
++    expected_weight = target / proposal
++    if not torch.allclose(weight, expected_weight, rtol=1e-12, atol=0.0):
++        raise ValueError("sampling_importance_weight must equal target_probability / proposal_probability")
++
++    representatives = _draw_representatives(
++        draw_number,
++        sampling_index,
++        sampling_stratum,
++        target,
++        proposal,
++        weight,
++    )
++
++    mask = response_mask.to(dtype=advantages.dtype)
++    valid_token_count = mask.sum(dim=-1)
++    if torch.any(valid_token_count <= 0):
++        raise ValueError("every generated response must contain at least one valid response token")
++    raw_second_moment_proxy = (advantages.square() * mask).sum(dim=-1) / valid_token_count
++    batch.batch["sampling_second_moment_proxy"] = raw_second_moment_proxy.detach()
++    apply_correction = bool(sampling_config.get("apply_importance_correction", True))
++    if apply_correction:
++        batch.batch["advantages"] = advantages * weight.to(device=advantages.device, dtype=advantages.dtype)[:, None]
++
++    draw_weight = weight[representatives]
++    draw_proposal = proposal[representatives]
++    weight_sum = draw_weight.sum()
++    ess = weight_sum.square() / draw_weight.square().sum()
++    cross_entropy_estimate = torch.mean(draw_weight * -torch.log(draw_proposal))
++    kl_estimate = torch.mean(draw_weight * torch.log(draw_weight))
++    draw_count = draw_weight.numel()
++    return {
++        "sampling/importance_weight_mean": draw_weight.mean().item(),
++        "sampling/importance_weight_min": draw_weight.min().item(),
++        "sampling/importance_weight_max": draw_weight.max().item(),
++        "sampling/importance_weight_ess": ess.item(),
++        "sampling/importance_weight_ess_fraction": (ess / draw_count).item(),
++        "sampling/target_proposal_cross_entropy_estimate": cross_entropy_estimate.item(),
++        "sampling/target_proposal_kl_estimate": kl_estimate.item(),
++        "sampling/min_proposal_probability": draw_proposal.min().item(),
++        "sampling/draw_count": float(draw_count),
++        "sampling/correction_applied": float(apply_correction),
++        "budget/sampled_prompts": float(draw_count),
++        "budget/completions": float(batch_size),
++        "budget/generated_tokens": float(response_mask.sum().item()),
++        "budget/reward_evaluations": float(batch_size),
++        "budget/actor_optimizer_updates": 1.0,
++    }
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index eccda70..5ea4558 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -49,6 +49,10 @@ from verl.trainer.ppo.metric_utils import (
+     compute_timing_metrics,
+     process_validation_metrics,
+ )
++from verl.trainer.ppo.prompt_sampling import (
++    apply_prompt_sampling_correction,
++    validate_prompt_sampling_config,
++)
+ from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+@@ -61,6 +65,17 @@ from verl.utils.torch_functional import masked_mean
+ from verl.utils.tracking import ValidationGenerationsLogger
+ 
+ 
++def _update_curriculum_sampler_metrics(sampler, batch: DataProto, metrics: dict) -> None:
++    """Update an experimental sampler and merge any diagnostics it returns."""
++
++    sampler_metrics = sampler.update(batch=batch)
++    if sampler_metrics is None:
++        return
++    if not isinstance(sampler_metrics, dict):
++        raise TypeError("curriculum sampler update metrics must be a dictionary or None")
++    metrics.update(sampler_metrics)
++
++
+ @dataclass
+ class ResourcePoolManager:
+     """
+@@ -309,6 +324,7 @@ class RayPPOTrainer:
+         self.tokenizer = tokenizer
+         self.processor = processor
+         self.config = config
++        validate_prompt_sampling_config(self.config)
+         self.reward_fn = reward_fn
+         self.val_reward_fn = val_reward_fn
+ 
+@@ -1199,6 +1215,8 @@ class RayPPOTrainer:
+                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                             config=self.config.algorithm,
+                         )
++                        sampling_metrics = apply_prompt_sampling_correction(batch, self.config)
++                        metrics.update(sampling_metrics)
+ 
+                     # update critic
+                     if self.use_critic:
+@@ -1287,7 +1305,7 @@ class RayPPOTrainer:
+ 
+                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+-                    self.train_dataloader.sampler.update(batch=batch)
++                    _update_curriculum_sampler_metrics(self.train_dataloader.sampler, batch, metrics)
+ 
+                 # TODO: make a canonical logger that supports various backend
+                 logger.log(data=metrics, step=self.global_steps)
+diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
+index b3f2aca..31c4c38 100644
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -121,6 +121,7 @@ class RolloutConfig(BaseConfig):
+     top_p: float = 1.0
+     do_sample: bool = True
+     n: int = 1
++    seed: int = 0
+ 
+     # Early termination threshold for multi-turn rollout in sglang.
+     # Abort remaining requests when (1 - over_sample_rate) * total_requests are completed.

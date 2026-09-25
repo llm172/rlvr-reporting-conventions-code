@@ -1,0 +1,11 @@
+# Install the patched verl 0.6.1 checkout separately (see README).
+numpy
+pandas
+pyarrow
+scipy
+math-verify==0.9.0
+transformers
+torch
+vllm
+omegaconf
+ninja
