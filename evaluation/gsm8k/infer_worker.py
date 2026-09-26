@@ -29,8 +29,9 @@ def main():
             lengths=[len(tokenizer.encode(x['prompt'],add_special_tokens=False)) for x in read_jsonl(task['items'])]
             if max(lengths)+task['max_tokens']>task['max_model_len']:
                 raise ValueError(f"Prompt exceeds context budget in {task['name']}: {max(lengths)}")
+        max_model_len=max(task['max_model_len'] for task in manifest['tasks'])
         llm=LLM(model=manifest['model'],dtype='bfloat16',tensor_parallel_size=1,
-                gpu_memory_utilization=.80,max_model_len=4096,max_num_seqs=256,
+                gpu_memory_utilization=.80,max_model_len=max_model_len,max_num_seqs=256,
                 trust_remote_code=True,enable_prefix_caching=True,enforce_eager=True,seed=20260908)
         for task in manifest['tasks']:
             folder=out/task['name'];folder.mkdir(exist_ok=True)

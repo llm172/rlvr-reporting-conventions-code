@@ -40,13 +40,15 @@ export MODEL_PATH=/models/Qwen2.5-7B-Instruct
 export HASH_DATA_DIR=/data/gsm8k_hash
 export BOXED_DATA_DIR=/data/gsm8k_boxed
 export GPU_COUNT=4
-for seed in 83 84 85 86 87; do
+for seed in 83 84 85; do
   bash scripts/train_crossed.sh hash "$seed"
   bash scripts/train_crossed.sh boxed "$seed"
 done
 ```
 
 The launcher exposes `MODEL_PATH`, data paths, `RUN_ROOT`, and `GPU_COUNT`. Changing model, data, or GPU count changes the recorded configuration. `scripts/gsm8k_boxed_reward.py` supplies the boxed-arm strict reward. `scripts/reward_lenient_gsm8k.py` and `scripts/passk_score.py` implement the answer-only reward control and operational readers.
+
+The manuscript reports the three crossed training seeds 83, 84, and 85. Seeds 86 and 87 and `evaluation/crossed/aggregate_extension.py` are retained as an optional five-seed extension from the experiment archive; they are not part of the reported results or the core reproduction command above.
 
 ## Evaluation and controls
 
@@ -58,13 +60,13 @@ touch "$(dirname /data/eval_manifest.json)/INFERENCE_FINISHED.json"
 python evaluation/gsm8k/score_all.py --root /data --workers 8
 ```
 
-After scoring finishes, run `python evaluation/gsm8k/freeze_cells.py --root /data --state MODEL_STATE` for each state. This computes the boxed-request strict scores and freezes the cell hashes required by the five-seed aggregator; use the original audit scorer via `--scorer` when combining with its archived cells.
+After scoring finishes, run `python evaluation/gsm8k/freeze_cells.py --root /data --state MODEL_STATE` for each state. This computes the boxed-request strict scores and freezes the cell hashes used by the crossed aggregation; use the original audit scorer via `--scorer` when combining with archived cells.
 
 The worker manifest has keys `state`, `model`, `model_metadata`, `gpu`, and `tasks`. Each task has `name`, `items`, `items_sha256`, `temperature`, `top_p`, `n`, `max_tokens`, `max_model_len`, `seed`, and `batch_items`. The recorded GSM8K tasks used temperature 0.6, top-p 0.95, one response, 640 maximum output tokens, 4,096 maximum context tokens, seed 20260908, and batches of 16 items. The item JSONL rows contain `id`, `prompt`, and `ground_truth`. The scoring queue stops after the `INFERENCE_FINISHED.json` marker is present. Prepare one manifest per model/checkpoint; keep the same frozen items and request prompts across trained states.
 
 `evaluation/gsm8k/build_inputs.py gsm8k --validation-parquet /data/validation_frozen.parquet --tokenizer /models/INITIAL_MODEL --convention hash --out /data/hash_items.jsonl` renders the matched 1,319-item test inputs; use the paired boxed Parquet with `--convention boxed`. For the arithmetic probe, run `build_inputs.py arithmetic --tokenizer /models/INITIAL_MODEL --out-dir /data/arithmetic`. It generates the fixed 32 development and 500 test expressions, then renders each with the model's initial tokenizer. These commands require the original frozen Parquets and tokenizer. New files are a reproduction attempt; compare their SHA256 hashes with the recorded inputs before claiming exact historical equivalence.
 
-The five-seed crossed aggregation uses frozen old-cell records plus the two extension seeds; invoke `evaluation/crossed/aggregate_extension.py --help` for its three input directories. It validates response counts and file hashes before computing each requested-convention interaction. The old audit inputs and response cells are not bundled.
+For the optional five-seed extension, `evaluation/crossed/aggregate_extension.py` combines the frozen 83--85 records with extension seeds 86 and 87; invoke it with `--help` for its input directories. It validates response counts and file hashes before computing each requested-convention interaction. The old audit inputs and response cells are not bundled.
 
 For MATH500 transfer, provide the frozen `protocol.json` and `inputs/math500_hash.jsonl` and `inputs/math500_boxed.jsonl` in one root directory. The protocol must name the three model paths and record the input hashes, decoding parameters, and model-loading options. The original input builder and frozen item files are not included; constructing new inputs changes the recorded experiment. Run one state per GPU (set `CUDA_VISIBLE_DEVICES` externally), then score and analyze the six cells:
 
